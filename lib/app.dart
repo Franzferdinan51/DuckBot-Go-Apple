@@ -1,0 +1,1655 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../services/gateway_service.dart';
+import '../services/discovery_service.dart';
+import '../services/openclaw_companion_service.dart';
+import '../services/app_settings_service.dart';
+import '../services/connection_monitor_service.dart';
+import '../services/theme_service.dart';
+import '../dialogs/connection_success_dialog.dart';
+import '../widgets/connection_status_card.dart';
+import 'screens/dashboard_screen.dart';
+import 'screens/chat_screen.dart';
+import 'screens/quick_actions_screen.dart';
+import 'screens/control_screen.dart';
+import 'screens/logs_screen.dart';
+import 'screens/settings_screen.dart';
+import 'screens/settings_advanced_screen.dart';
+import 'screens/browser_control_screen.dart';
+import 'screens/workflows_screen.dart';
+import 'screens/scheduled_tasks_screen.dart';
+import 'screens/model_hub_screen.dart';
+import 'screens/local_installer_screen.dart';
+import 'screens/office_screen.dart';
+import 'screens/council_screen.dart';
+
+class DuckBotGoApp extends StatefulWidget {
+  const DuckBotGoApp({super.key});
+
+  @override
+  State<DuckBotGoApp> createState() => _DuckBotGoAppState();
+}
+
+class _DuckBotGoAppState extends State<DuckBotGoApp> {
+  final DiscoveryService _discoveryService = DiscoveryService();
+  final OpenClawCompanionService _companionService =
+      OpenClawCompanionService();
+  static const Duration _startupProbeTimeout = Duration(seconds: 2);
+  static const Duration _backgroundDiscoveryTimeout = Duration(seconds: 18);
+  GatewayService? _gatewayService;
+  bool _isLoading = true;
+  bool _showGuidedSetup = false;
+  String? _initialError;
+  Timer? _backgroundDiscoveryTimer;
+
+  // Global navigator key for route handling
+  final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeConnection();
+  }
+
+  Future<void> _initializeConnection() async {
+    setState(() {
+      _isLoading = true;
+    });
+
+    final prefs = await SharedPreferences.getInstance();
+
+    // Check if first launch
+    final hasShownSuccessDialog =
+        prefs.getBool('has_shown_connection_success') ?? false;
+
+    String? savedGatewayUrl = prefs.getString('gateway_url');
+    String? token = prefs.getString('gateway_token');
+    String? gatewayName = prefs.getString('gateway_name');
+    final lastConnected = await _discoveryService.getLastConnected();
+
+    // Try LOCAL duck-cli on this phone FIRST (preferred)
+    // This is duck-cli running natively on the Android device
+    final localCandidates = <Map<String, String?>>[
+      {
+        'url': 'http://127.0.0.1:18789',
+        'name': 'Local duck-cli (This Phone)',
+        'priority': '1',
+      },
+      {
+        'url': 'http://localhost:18789',
+        'name': 'Local duck-cli (Loopback)',
+        'priority': '2',
+      },
+      {
+        'url': 'http://10.0.2.2:18789',
+        'name': 'Android Emulator duck-cli',
+        'priority': '3',
+      },
+    ];
+
+    for (final candidate in localCandidates) {
+      if (await _tryStartupGateway(
+        prefs,
+        gatewayUrl: candidate['url']!,
+        gatewayName: candidate['name'],
+        token: token,
+        showSuccessDialog: !hasShownSuccessDialog,
+        timeout: _startupProbeTimeout,
+      )) {
+        return;
+      }
+    }
+
+    // Try Mac/remote duck-cli as fallback
+    final remoteCandidates = <Map<String, String?>>[
+      {
+        'url': _companionService.baseUrl,
+        'name': 'Mac duckbot-go Companion',
+      },
+      if (savedGatewayUrl != null && savedGatewayUrl.isNotEmpty)
+        {
+          'url': savedGatewayUrl,
+          'name': gatewayName ?? 'Saved Gateway',
+          'token': token,
+        },
+      if (lastConnected != null &&
+          lastConnected.url.isNotEmpty &&
+          lastConnected.url != savedGatewayUrl)
+        {
+          'url': lastConnected.url,
+          'name': lastConnected.name,
+          'token': lastConnected.token ?? token,
+        },
+    ];
+
+    for (final candidate in remoteCandidates) {
+      final candidateUrl = candidate['url'];
+      if (candidateUrl == null || candidateUrl == savedGatewayUrl) continue;
+
+      if (await _tryStartupGateway(
+        prefs,
+        gatewayUrl: candidateUrl,
+        gatewayName: candidate['name'],
+        token: candidate['token'] ?? token,
+        showSuccessDialog: !hasShownSuccessDialog,
+        timeout: _startupProbeTimeout,
+      )) {
+        return;
+      }
+    }
+
+    for (final candidate in fallbackCandidates) {
+      final candidateUrl = candidate['url'];
+      if (candidateUrl == null || candidateUrl == gatewayUrl) continue;
+
+      if (await _tryStartupGateway(
+        prefs,
+        gatewayUrl: candidateUrl,
+        gatewayName: candidate['name'],
+        token: candidate['token'] ?? token,
+        showSuccessDialog: !hasShownSuccessDialog,
+        timeout: _startupProbeTimeout,
+      )) {
+        return;
+      }
+    }
+
+    _enterOfflineMode(gatewayUrl);
+    unawaited(_continueDiscoveryInBackground(
+      prefs,
+      token: token,
+    ));
+  }
+
+  Future<bool> _tryStartupGateway(
+    SharedPreferences prefs, {
+    required String gatewayUrl,
+    String? gatewayName,
+    String? token,
+    required bool showSuccessDialog,
+    Duration timeout = _startupProbeTimeout,
+  }) async {
+    final service = GatewayService(baseUrl: gatewayUrl, token: token);
+    final status = await service.getStatus(timeout: timeout);
+    if (status == null || !status.online) {
+      return false;
+    }
+
+    _gatewayService = service;
+    await prefs.setString('gateway_url', gatewayUrl);
+    if (gatewayName != null && gatewayName.isNotEmpty) {
+      await prefs.setString('gateway_name', gatewayName);
+    }
+    if (token != null && token.isNotEmpty) {
+      await prefs.setString('gateway_token', token);
+    }
+    await prefs.setBool('has_completed_setup', true);
+    if (showSuccessDialog) {
+      await prefs.setBool('has_shown_connection_success', true);
+    }
+
+    connectionMonitor.startMonitoring(
+      service,
+      gatewayName: gatewayName,
+    );
+
+    if (!mounted) return true;
+
+    setState(() {
+      _isLoading = false;
+      _showGuidedSetup = false;
+      _initialError = null;
+    });
+
+    if (showSuccessDialog) {
+      await showConnectionSuccessDialog(
+        context: context,
+        gatewayName: gatewayName ?? 'duck-cli Runtime',
+        gatewayUrl: gatewayUrl,
+        status: status,
+      );
+    }
+
+    return true;
+  }
+
+  void _enterOfflineMode(String? gatewayUrl) {
+    if (!mounted) return;
+
+    setState(() {
+      _isLoading = false;
+      _gatewayService = null;
+      // Keep the main shell reachable even when setup is incomplete or the
+      // last gateway is down. Chat, Settings, and local install/repair flows
+      // should stay available in offline mode.
+      _showGuidedSetup = false;
+      _initialError = gatewayUrl != null
+          ? 'Could not connect to the saved duck-cli runtime. Open Settings or Connect to reconfigure.'
+          : 'No duck-cli runtime configured. Open Settings, Connect, or the local installer.';
+    });
+  }
+
+  Future<void> _continueDiscoveryInBackground(
+    SharedPreferences prefs, {
+    required String? token,
+  }) async {
+    if (_gatewayService != null) return;
+
+    var timedOut = false;
+    _backgroundDiscoveryTimer?.cancel();
+    final deadlineTimer = Timer(_backgroundDiscoveryTimeout, () {
+      timedOut = true;
+    });
+    _backgroundDiscoveryTimer = deadlineTimer;
+
+    final discovered = await _discoveryService.scan(stopAtFirstHealthy: true);
+
+    if (identical(_backgroundDiscoveryTimer, deadlineTimer)) {
+      deadlineTimer.cancel();
+      _backgroundDiscoveryTimer = null;
+    }
+
+    if (timedOut) {
+      return;
+    }
+
+    for (final gateway in discovered) {
+      if (_gatewayService != null) return;
+
+      final connected = await _tryStartupGateway(
+        prefs,
+        gatewayUrl: gateway.url,
+        gatewayName: gateway.name,
+        token: gateway.token ?? token,
+        showSuccessDialog: false,
+        timeout: _startupProbeTimeout,
+      );
+      if (connected) {
+        return;
+      }
+    }
+  }
+
+  void _onGatewayChanged() {
+    // Reload gateway service with new settings
+    _loadGatewayService();
+  }
+
+  Future<void> _loadGatewayService() async {
+    final prefs = await SharedPreferences.getInstance();
+    final gatewayUrl = prefs.getString('gateway_url');
+    final token = prefs.getString('gateway_token');
+
+    setState(() {
+      _gatewayService = gatewayUrl == null || gatewayUrl.isEmpty
+          ? null
+          : GatewayService(baseUrl: gatewayUrl, token: token);
+    });
+  }
+
+  @override
+  void dispose() {
+    _backgroundDiscoveryTimer?.cancel();
+    _discoveryService.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: themeService,
+      builder: (context, child) {
+        return MaterialApp(
+          title: 'DuckBot Go',
+          debugShowCheckedModeBanner: false,
+          theme: themeService.getLightTheme(),
+          darkTheme: themeService.getDarkTheme(),
+          themeMode: themeService.themeMode,
+          navigatorKey: _navigatorKey,
+          // Named routes for navigation with tab selection
+          routes: {
+            '/main': (context) => _isLoading
+                ? const _LoadingScreen()
+                : _showGuidedSetup
+                    ? _GuidedSetupScreen(
+                        error: _initialError,
+                        onComplete: () {
+                          setState(() {
+                            _showGuidedSetup = false;
+                            _loadGatewayService();
+                          });
+                        },
+                      )
+                    : MainNavigationScreen(
+                        gatewayService: _gatewayService,
+                        onGatewayChanged: _onGatewayChanged,
+                        initialTab: _getInitialTab(context),
+                        startupNotice: _initialError,
+                      ),
+          },
+          home: _isLoading
+              ? const _LoadingScreen()
+              : _showGuidedSetup
+                  ? _GuidedSetupScreen(
+                      error: _initialError,
+                      onComplete: () {
+                        setState(() {
+                          _showGuidedSetup = false;
+                          _loadGatewayService();
+                        });
+                      },
+                    )
+                  : MainNavigationScreen(
+                      gatewayService: _gatewayService,
+                      onGatewayChanged: _onGatewayChanged,
+                      startupNotice: _initialError,
+                    ),
+        );
+      },
+    );
+  }
+
+  /// Get initial tab from route parameters
+  int? _getInitialTab(BuildContext context) {
+    final args =
+        ModalRoute.of(context)?.settings.arguments as Map<String, dynamic>?;
+    if (args != null && args.containsKey('tab')) {
+      final tab = args['tab'] as String;
+      switch (tab) {
+        case 'chat':
+          return 1;
+        case 'home':
+          return 0;
+        case 'actions':
+          return 2;
+        case 'settings':
+          return 3;
+        default:
+          return null;
+      }
+    }
+    return null;
+  }
+}
+
+class _LoadingScreen extends StatelessWidget {
+  const _LoadingScreen();
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const CircularProgressIndicator(),
+            const SizedBox(height: 24),
+            Text(
+              'Connecting to duck-cli...',
+              style: Theme.of(context).textTheme.titleLarge,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Searching for OpenClaw on your network',
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _GuidedSetupScreen extends StatelessWidget {
+  final String? error;
+  final VoidCallback onComplete;
+
+  const _GuidedSetupScreen({this.error, required this.onComplete});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Welcome to Duck CLI Mobile'),
+        automaticallyImplyLeading: false,
+      ),
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(24),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.primaryContainer,
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(
+                  Icons.android,
+                  size: 80,
+                  color: Colors.orange,
+                ),
+              ),
+              const SizedBox(height: 32),
+              Text(
+                'Let\'s Get You Connected!',
+                style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                      fontWeight: FontWeight.bold,
+                    ),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                error ?? 'Choose how you want to use Duck CLI Mobile:',
+                style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                      color: Theme.of(context)
+                          .colorScheme
+                          .onSurface
+                          .withOpacity(0.7),
+                    ),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 40),
+
+              // Option 1: Install Locally
+              Card(
+                elevation: 4,
+                child: InkWell(
+                  onTap: () => _showInstallLocallyDialog(context),
+                  borderRadius: BorderRadius.circular(16),
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      children: [
+                        Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: Colors.green.withOpacity(0.1),
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: const Icon(
+                                Icons.phone_android,
+                                color: Colors.green,
+                                size: 32,
+                              ),
+                            ),
+                            const SizedBox(width: 16),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    'Install on This Phone',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .titleMedium
+                                        ?.copyWith(
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    'Install OpenClaw locally via Termux',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodyMedium
+                                        ?.copyWith(
+                                          color: Theme.of(context)
+                                              .colorScheme
+                                              .onSurface
+                                              .withOpacity(0.7),
+                                        ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const Icon(
+                              Icons.chevron_right,
+                              size: 28,
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: Colors.blue.withOpacity(0.05),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '✨ Best for:',
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .labelLarge
+                                    ?.copyWith(
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                '• Using this phone as your OpenClaw node\n• Running automations on this device\n• Voice control and mobile access',
+                                style: Theme.of(context).textTheme.bodySmall,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // Option 2: Connect to Remote
+              Card(
+                elevation: 4,
+                child: InkWell(
+                  onTap: () => _showConnectRemoteDialog(context, onComplete),
+                  borderRadius: BorderRadius.circular(16),
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      children: [
+                        Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: Colors.blue.withOpacity(0.1),
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: const Icon(
+                                Icons.cloud,
+                                color: Colors.blue,
+                                size: 32,
+                              ),
+                            ),
+                            const SizedBox(width: 16),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    'Connect to Remote Gateway',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .titleMedium
+                                        ?.copyWith(
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    'Connect to OpenClaw on another device',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodyMedium
+                                        ?.copyWith(
+                                          color: Theme.of(context)
+                                              .colorScheme
+                                              .onSurface
+                                              .withOpacity(0.7),
+                                        ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const Icon(
+                              Icons.chevron_right,
+                              size: 28,
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: Colors.purple.withOpacity(0.05),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '✨ Best for:',
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .labelLarge
+                                    ?.copyWith(
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                '• OpenClaw already running on PC/server\n• Using this phone as a remote control\n• Monitoring from mobile',
+                                style: Theme.of(context).textTheme.bodySmall,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showInstallLocallyDialog(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.phone_android, color: Colors.green),
+            SizedBox(width: 8),
+            Text('Install on This Phone'),
+          ],
+        ),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'This will install OpenClaw directly on your phone using Termux.',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 16),
+              const Text('Requirements:'),
+              const SizedBox(height: 8),
+              _buildRequirementItem('Termux app (from F-Droid)'),
+              _buildRequirementItem('Node.js installed'),
+              _buildRequirementItem('Internet connection'),
+              const SizedBox(height: 16),
+              const Text('Steps:'),
+              const SizedBox(height: 8),
+              _buildStepItem('1', 'Download Termux from F-Droid'),
+              _buildStepItem('2', 'Open Termux and run: pkg install nodejs'),
+              _buildStepItem('3', 'Tap "Start Installation" below'),
+              const SizedBox(height: 16),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.amber.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.amber),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.info_outline,
+                        color: Colors.amber, size: 20),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Termux not available on Google Play. Must download from F-Droid.',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton.icon(
+            onPressed: () {
+              Navigator.pop(context);
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => LocalInstallerScreen(
+                    onInstallationComplete: () {
+                      // Refresh app state after installation
+                      onComplete();
+                    },
+                  ),
+                ),
+              );
+            },
+            icon: const Icon(Icons.download),
+            label: const Text('Start Installation'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showConnectRemoteDialog(BuildContext context, VoidCallback onComplete) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.cloud, color: Colors.blue),
+            SizedBox(width: 8),
+            Text('Connect to Remote Gateway'),
+          ],
+        ),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Connect to an OpenClaw gateway running on another device.',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 16),
+              const Text('Connection Options:'),
+              const SizedBox(height: 8),
+              _buildConnectionOption(
+                'Auto-Discover',
+                'Scan network for gateways',
+                Icons.wifi,
+                () {
+                  Navigator.pop(context);
+                  onComplete();
+                },
+              ),
+              const SizedBox(height: 8),
+              _buildConnectionOption(
+                'Manual Entry',
+                'Enter IP and port manually',
+                Icons.edit,
+                () {
+                  Navigator.pop(context);
+                  onComplete();
+                },
+              ),
+              const SizedBox(height: 8),
+              _buildConnectionOption(
+                'Tailscale',
+                'Connect via private network',
+                Icons.security,
+                () {
+                  Navigator.pop(context);
+                  onComplete();
+                },
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton.icon(
+            onPressed: () {
+              Navigator.pop(context);
+              onComplete();
+            },
+            icon: const Icon(Icons.search),
+            label: const Text('Find Gateways'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRequirementItem(String text) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        children: [
+          const Icon(Icons.check_circle, color: Colors.green, size: 16),
+          const SizedBox(width: 8),
+          Text(text),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStepItem(String step, String text) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(4),
+            decoration: BoxDecoration(
+              color: Colors.blue.withOpacity(0.1),
+              shape: BoxShape.circle,
+            ),
+            child: Text(
+              step,
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(child: Text(text)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildConnectionOption(
+      String title, String description, IconData icon, VoidCallback onTap) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Row(
+          children: [
+            Icon(icon, color: Colors.blue),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  Text(
+                    description,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.grey[600],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const Icon(Icons.chevron_right),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class MainNavigationScreen extends StatefulWidget {
+  final GatewayService? gatewayService;
+  final VoidCallback onGatewayChanged;
+  final int? initialTab;
+  final String? startupNotice;
+
+  const MainNavigationScreen({
+    super.key,
+    this.gatewayService,
+    required this.onGatewayChanged,
+    this.initialTab,
+    this.startupNotice,
+  });
+
+  @override
+  State<MainNavigationScreen> createState() => _MainNavigationScreenState();
+}
+
+class _MainNavigationScreenState extends State<MainNavigationScreen> {
+  late int _currentIndex;
+  late GatewayService? _gatewayService;
+  final AppSettingsService _appSettings = AppSettingsService();
+  bool _didShowStartupNotice = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _gatewayService = widget.gatewayService;
+    _currentIndex = widget.initialTab ?? 0;
+    _appSettings.addListener(_onSettingsChanged);
+    _scheduleStartupNotice();
+  }
+
+  @override
+  void didUpdateWidget(covariant MainNavigationScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    final gatewayChanged =
+        oldWidget.gatewayService?.baseUrl != widget.gatewayService?.baseUrl ||
+            oldWidget.gatewayService?.token != widget.gatewayService?.token;
+
+    if (gatewayChanged) {
+      _gatewayService = widget.gatewayService;
+    }
+
+    if (oldWidget.startupNotice != widget.startupNotice) {
+      _didShowStartupNotice = false;
+      _scheduleStartupNotice();
+    }
+  }
+
+  @override
+  void dispose() {
+    _appSettings.removeListener(_onSettingsChanged);
+    super.dispose();
+  }
+
+  void _onSettingsChanged() {
+    // Rebuild navigation when mode changes
+    setState(() {});
+  }
+
+  void _onModeChanged() {
+    // Force rebuild of navigation
+    setState(() {
+      _currentIndex = 0; // Reset to home tab
+    });
+  }
+
+  void _openTab(int index) {
+    setState(() {
+      _currentIndex = index;
+    });
+  }
+
+  void _scheduleStartupNotice() {
+    final notice = widget.startupNotice;
+    if (_didShowStartupNotice || notice == null || notice.trim().isEmpty) {
+      return;
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _didShowStartupNotice) return;
+      _didShowStartupNotice = true;
+
+      final messenger = ScaffoldMessenger.maybeOf(context);
+      messenger?.showSnackBar(
+        SnackBar(
+          content: Text(notice),
+          duration: const Duration(seconds: 8),
+          action: SnackBarAction(
+            label: 'Settings',
+            onPressed: _openSettingsTab,
+          ),
+        ),
+      );
+    });
+  }
+
+  void _openSettingsTab() {
+    setState(() {
+      _currentIndex = _settingsTabIndexForMode(_appSettings.currentMode);
+    });
+  }
+
+  int _settingsTabIndexForMode(AppMode mode) {
+    switch (mode) {
+      case AppMode.basic:
+        return 5;  // Home=0, Chat=1, Actions=2, Office=3, Council=4, Settings=5
+      case AppMode.powerUser:
+        return 6;  // +Tools
+      case AppMode.developer:
+        return 7;  // +Dev
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Build navigation based on current mode
+    final destinations = _buildNavDestinations();
+
+    return Scaffold(
+      body: IndexedStack(
+        index: _currentIndex,
+        children: _buildScreens(),
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _currentIndex,
+        onDestinationSelected: (index) {
+          setState(() {
+            _currentIndex = index;
+          });
+        },
+        destinations: destinations,
+      ),
+    );
+  }
+
+  List<NavigationDestination> _buildNavDestinations() {
+    final mode = _appSettings.currentMode;
+
+    // All modes have these core tabs
+    final destinations = <NavigationDestination>[
+      const NavigationDestination(
+        icon: Icon(Icons.home_outlined),
+        selectedIcon: Icon(Icons.home),
+        label: 'Home',
+      ),
+      const NavigationDestination(
+        icon: Icon(Icons.chat_outlined),
+        selectedIcon: Icon(Icons.chat),
+        label: 'Chat',
+      ),
+    ];
+
+    // Add Actions tab (different for each mode)
+    destinations.add(NavigationDestination(
+      icon: Icon(Icons.bolt_outlined, color: _getModeColor(mode)),
+      selectedIcon: Icon(Icons.bolt, color: _getModeColor(mode)),
+      label: 'Actions',
+    ));
+
+    // Office tab - 3D Voxel Office
+    destinations.add(NavigationDestination(
+      icon: Icon(Icons.apartment_outlined, color: _getModeColor(mode)),
+      selectedIcon: Icon(Icons.apartment, color: _getModeColor(mode)),
+      label: 'Office',
+    ));
+
+    // Council tab - AI Council Chamber
+    destinations.add(NavigationDestination(
+      icon: Icon(Icons.hub_outlined, color: _getModeColor(mode)),
+      selectedIcon: Icon(Icons.hub, color: _getModeColor(mode)),
+      label: 'Council',
+    ));
+
+    // Power User and Developer get Tools tab
+    if (mode == AppMode.powerUser || mode == AppMode.developer) {
+      destinations.add(NavigationDestination(
+        icon: Icon(Icons.build_outlined, color: _getModeColor(mode)),
+        selectedIcon: Icon(Icons.build, color: _getModeColor(mode)),
+        label: 'Tools',
+      ));
+    }
+
+    // Developer gets Dev tab
+    if (mode == AppMode.developer) {
+      destinations.add(NavigationDestination(
+        icon: Icon(Icons.code_outlined, color: _getModeColor(mode)),
+        selectedIcon: Icon(Icons.code, color: _getModeColor(mode)),
+        label: 'Dev',
+      ));
+    }
+
+    // All modes have Settings
+    destinations.add(const NavigationDestination(
+      icon: Icon(Icons.settings_outlined),
+      selectedIcon: Icon(Icons.settings),
+      label: 'Settings',
+    ));
+
+    return destinations;
+  }
+
+  List<Widget> _buildScreens() {
+    final mode = _appSettings.currentMode;
+
+    final screens = <Widget>[
+      // Tab 0: Home (Dashboard)
+      DashboardScreen(
+        gatewayService: _gatewayService,
+        onGatewayChanged: widget.onGatewayChanged,
+        onOpenChat: () => _openTab(1),
+      ),
+      // Tab 1: Chat
+      ChatScreen(gatewayService: _gatewayService),
+    ];
+
+    // Tab 2: Actions
+    screens.add(_ActionsHubScreen(
+      mode: mode,
+      showAdvanced: mode != AppMode.basic,
+      gatewayService: _gatewayService,
+      onOpenChat: () => _openTab(1),
+    ));
+
+    // Tab 3: Office - 3D Voxel Office
+    screens.add(OfficeScreen());
+
+    // Tab 4: Council - AI Council Chamber
+    screens.add(CouncilScreen());
+
+    // Tab 5: Tools (Power User and Developer only)
+    if (mode == AppMode.powerUser || mode == AppMode.developer) {
+      screens.add(_ToolsHubScreen(
+        showDeveloperTools: mode == AppMode.developer,
+      ));
+    }
+
+    // Tab 4: Dev Tools (Developer only)
+    if (mode == AppMode.developer) {
+      screens.add(_DevToolsScreen(gatewayService: _gatewayService));
+    }
+
+    // Settings tab (last)
+    screens.add(SettingsScreen(
+      onGatewayChanged: widget.onGatewayChanged,
+      onModeChanged: _onModeChanged,
+    ));
+
+    return screens;
+  }
+
+  Color _getModeColor(AppMode mode) {
+    switch (mode) {
+      case AppMode.basic:
+        return Colors.green;
+      case AppMode.powerUser:
+        return Colors.blue;
+      case AppMode.developer:
+        return Colors.purple;
+    }
+  }
+}
+
+// Hub screen combining Quick Actions and Control
+class _ActionsHubScreen extends StatefulWidget {
+  final AppMode mode;
+  final bool showAdvanced;
+  final GatewayService? gatewayService;
+  final VoidCallback? onOpenChat;
+
+  const _ActionsHubScreen({
+    this.mode = AppMode.basic,
+    this.showAdvanced = false,
+    this.gatewayService,
+    this.onOpenChat,
+  });
+
+  @override
+  State<_ActionsHubScreen> createState() => _ActionsHubScreenState();
+}
+
+class _ActionsHubScreenState extends State<_ActionsHubScreen>
+    with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+  }
+
+  @override
+  void didUpdateWidget(_ActionsHubScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Update tab controller if mode changed
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Row(
+          children: [
+            const Text('Actions'),
+            const SizedBox(width: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+              decoration: BoxDecoration(
+                color: _getModeColor(widget.mode).withOpacity(0.2),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Text(
+                widget.mode.name.toUpperCase(),
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.bold,
+                  color: _getModeColor(widget.mode),
+                ),
+              ),
+            ),
+          ],
+        ),
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(icon: Icon(Icons.flash_on), text: 'Quick'),
+            Tab(icon: Icon(Icons.gamepad), text: 'Control'),
+          ],
+        ),
+      ),
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          QuickActionsScreen(
+              showAdvanced: widget.showAdvanced,
+              gatewayService: widget.gatewayService,
+              onOpenChat: widget.onOpenChat),
+          ControlScreen(
+            showAdvanced: widget.showAdvanced,
+            gatewayService: widget.gatewayService,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Color _getModeColor(AppMode mode) {
+    switch (mode) {
+      case AppMode.basic:
+        return Colors.green;
+      case AppMode.powerUser:
+        return Colors.blue;
+      case AppMode.developer:
+        return Colors.purple;
+    }
+  }
+}
+
+// Hub screen combining Logs, Browser, Workflows, Tasks, and AI Models
+class _ToolsHubScreen extends StatefulWidget {
+  final bool showDeveloperTools;
+
+  const _ToolsHubScreen({
+    this.showDeveloperTools = false,
+  });
+
+  @override
+  State<_ToolsHubScreen> createState() => _ToolsHubScreenState();
+}
+
+class _ToolsHubScreenState extends State<_ToolsHubScreen>
+    with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 5, vsync: this);
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Row(
+          children: [
+            const Text('Tools'),
+            if (widget.showDeveloperTools) ...[
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.purple.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: const Text(
+                  'DEV',
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.purple,
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+        bottom: TabBar(
+          controller: _tabController,
+          isScrollable: true,
+          tabs: const [
+            Tab(icon: Icon(Icons.article), text: 'Logs'),
+            Tab(icon: Icon(Icons.public), text: 'Browser'),
+            Tab(icon: Icon(Icons.account_tree), text: 'Workflows'),
+            Tab(icon: Icon(Icons.schedule), text: 'Tasks'),
+            Tab(icon: Icon(Icons.analytics), text: 'AI Models'),
+          ],
+        ),
+      ),
+      body: TabBarView(
+        controller: _tabController,
+        children: const [
+          LogsScreen(),
+          BrowserControlScreen(),
+          WorkflowsScreen(),
+          ScheduledTasksScreen(),
+          ModelHubScreen(),
+        ],
+      ),
+    );
+  }
+}
+
+// Developer Tools screen (Developer mode only)
+class _DevToolsScreen extends StatelessWidget {
+  final GatewayService? gatewayService;
+
+  const _DevToolsScreen({this.gatewayService});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Row(
+          children: [
+            const Text('Dev Tools'),
+            const SizedBox(width: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+              decoration: BoxDecoration(
+                color: Colors.purple.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Text(
+                'DEVELOPER',
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.purple,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.terminal, color: Colors.purple),
+              title: const Text('API Explorer'),
+              subtitle: const Text('Test API endpoints directly'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (context) => _ApiExplorerScreen(
+                      gatewayService: gatewayService,
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.bug_report, color: Colors.red),
+              title: const Text('Debug Console'),
+              subtitle: const Text('View debug logs and errors'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(builder: (context) => const LogsScreen()),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.storage, color: Colors.orange),
+              title: const Text('Raw Logs'),
+              subtitle: const Text('View raw gateway logs'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(builder: (context) => const LogsScreen()),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.settings_suggest, color: Colors.blue),
+              title: const Text('Advanced Config'),
+              subtitle: const Text('Edit raw configuration'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (context) => const AdvancedSettingsScreen(),
+                  ),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.network_check, color: Colors.green),
+              title: const Text('Network Inspector'),
+              subtitle: const Text('Monitor network requests'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (context) => _NetworkInspectorScreen(
+                      gatewayService: gatewayService,
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ApiExplorerScreen extends StatelessWidget {
+  final GatewayService? gatewayService;
+
+  const _ApiExplorerScreen({this.gatewayService});
+
+  @override
+  Widget build(BuildContext context) {
+    final baseUrl = gatewayService?.baseUrl ??
+        connectionMonitor.state.gatewayUrl ??
+        'http://localhost:18789';
+
+    final endpoints = <Map<String, String>>[
+      {
+        'label': 'Health Check',
+        'method': 'GET',
+        'path': '$baseUrl/health',
+        'curl': 'curl $baseUrl/health',
+      },
+      {
+        'label': 'Gateway Status',
+        'method': 'GET',
+        'path': '$baseUrl/api/gateway',
+        'curl': 'curl $baseUrl/api/gateway',
+      },
+      {
+        'label': 'Gateway Logs',
+        'method': 'GET',
+        'path': '$baseUrl/api/logs?limit=100',
+        'curl': 'curl "$baseUrl/api/logs?limit=100"',
+      },
+      {
+        'label': 'Agent Action',
+        'method': 'POST',
+        'path': '$baseUrl/api/gateway/action',
+        'curl':
+            'curl -X POST $baseUrl/api/gateway/action -H "Content-Type: application/json" -d \'{"action":"history","sessionKey":"main","limit":20}\'',
+      },
+    ];
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('API Explorer')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.link),
+              title: const Text('Current Gateway'),
+              subtitle: SelectableText(baseUrl),
+            ),
+          ),
+          const SizedBox(height: 12),
+          ...endpoints.map((endpoint) {
+            final curl = endpoint['curl']!;
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: endpoint['method'] == 'POST'
+                                  ? Colors.orange.withOpacity(0.15)
+                                  : Colors.green.withOpacity(0.15),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Text(
+                              endpoint['method']!,
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                color: endpoint['method'] == 'POST'
+                                    ? Colors.orange[800]
+                                    : Colors.green[800],
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              endpoint['label']!,
+                              style: Theme.of(context).textTheme.titleMedium,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      SelectableText(
+                        endpoint['path']!,
+                        style: Theme.of(context).textTheme.bodyMedium,
+                      ),
+                      const SizedBox(height: 12),
+                      OutlinedButton.icon(
+                        onPressed: () async {
+                          await Clipboard.setData(ClipboardData(text: curl));
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('cURL command copied'),
+                              ),
+                            );
+                          }
+                        },
+                        icon: const Icon(Icons.copy),
+                        label: const Text('Copy cURL'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          }),
+        ],
+      ),
+    );
+  }
+}
+
+class _NetworkInspectorScreen extends StatelessWidget {
+  final GatewayService? gatewayService;
+
+  const _NetworkInspectorScreen({this.gatewayService});
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: connectionMonitor,
+      builder: (context, _) {
+        final state = connectionMonitor.state;
+        final gatewayUrl = gatewayService?.baseUrl ??
+            state.gatewayUrl ??
+            'No duck-cli runtime configured';
+
+        return Scaffold(
+          appBar: AppBar(title: const Text('Network Inspector')),
+          body: ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              ConnectionStatusCard(
+                onRetry: () => connectionMonitor.reconnect(),
+              ),
+              const SizedBox(height: 16),
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Raw Connection State',
+                        style:
+                            Theme.of(context).textTheme.titleMedium?.copyWith(
+                                  fontWeight: FontWeight.bold,
+                                ),
+                      ),
+                      const SizedBox(height: 12),
+                      _buildInspectorRow('Gateway URL', gatewayUrl),
+                      _buildInspectorRow('Status', state.statusText),
+                      _buildInspectorRow('Latency', '${state.latencyMs}ms'),
+                      _buildInspectorRow(
+                        'Last Ping',
+                        state.lastPing?.toIso8601String() ?? 'Never',
+                      ),
+                      _buildInspectorRow(
+                        'Error',
+                        state.errorMessage?.isNotEmpty == true
+                            ? state.errorMessage!
+                            : 'None',
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildInspectorRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 96,
+            child: Text(
+              label,
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+          ),
+          Expanded(child: SelectableText(value)),
+        ],
+      ),
+    );
+  }
+}
